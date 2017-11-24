@@ -5,9 +5,9 @@
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
+ * <p>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p>
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -16,72 +16,38 @@
  */
 package org.apache.activemq.transport.mqtt;
 
-import java.io.IOException;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.zip.DataFormatException;
-import java.util.zip.Inflater;
+import org.apache.activemq.broker.BrokerService;
+import org.apache.activemq.broker.BrokerServiceAware;
+import org.apache.activemq.broker.region.policy.RetainedMessageSubscriptionRecoveryPolicy;
+import org.apache.activemq.command.*;
+import org.apache.activemq.transport.mqtt.strategy.MQTTSubscriptionStrategy;
+import org.apache.activemq.util.*;
+import org.fusesource.hawtbuf.Buffer;
+import org.fusesource.hawtbuf.UTF8Buffer;
+import org.fusesource.mqtt.client.QoS;
+import org.fusesource.mqtt.client.Topic;
+import org.fusesource.mqtt.codec.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.jms.Destination;
 import javax.jms.InvalidClientIDException;
 import javax.jms.JMSException;
 import javax.jms.Message;
 import javax.security.auth.login.CredentialException;
-
-import org.apache.activemq.broker.BrokerService;
-import org.apache.activemq.broker.BrokerServiceAware;
-import org.apache.activemq.broker.region.policy.RetainedMessageSubscriptionRecoveryPolicy;
-import org.apache.activemq.command.ActiveMQBytesMessage;
-import org.apache.activemq.command.ActiveMQDestination;
-import org.apache.activemq.command.ActiveMQMapMessage;
-import org.apache.activemq.command.ActiveMQMessage;
-import org.apache.activemq.command.ActiveMQTextMessage;
-import org.apache.activemq.command.Command;
-import org.apache.activemq.command.ConnectionError;
-import org.apache.activemq.command.ConnectionId;
-import org.apache.activemq.command.ConnectionInfo;
-import org.apache.activemq.command.ExceptionResponse;
-import org.apache.activemq.command.MessageAck;
-import org.apache.activemq.command.MessageDispatch;
-import org.apache.activemq.command.MessageId;
-import org.apache.activemq.command.ProducerId;
-import org.apache.activemq.command.ProducerInfo;
-import org.apache.activemq.command.Response;
-import org.apache.activemq.command.SessionId;
-import org.apache.activemq.command.SessionInfo;
-import org.apache.activemq.command.ShutdownInfo;
-import org.apache.activemq.transport.mqtt.strategy.MQTTSubscriptionStrategy;
-import org.apache.activemq.util.ByteArrayOutputStream;
-import org.apache.activemq.util.ByteSequence;
-import org.apache.activemq.util.FactoryFinder;
-import org.apache.activemq.util.IOExceptionSupport;
-import org.apache.activemq.util.IdGenerator;
-import org.apache.activemq.util.JMSExceptionSupport;
-import org.apache.activemq.util.LRUCache;
-import org.apache.activemq.util.LongSequenceGenerator;
-import org.fusesource.hawtbuf.Buffer;
-import org.fusesource.hawtbuf.UTF8Buffer;
-import org.fusesource.mqtt.client.QoS;
-import org.fusesource.mqtt.client.Topic;
-import org.fusesource.mqtt.codec.CONNACK;
-import org.fusesource.mqtt.codec.CONNECT;
-import org.fusesource.mqtt.codec.DISCONNECT;
-import org.fusesource.mqtt.codec.MQTTFrame;
-import org.fusesource.mqtt.codec.PINGREQ;
-import org.fusesource.mqtt.codec.PINGRESP;
-import org.fusesource.mqtt.codec.PUBACK;
-import org.fusesource.mqtt.codec.PUBCOMP;
-import org.fusesource.mqtt.codec.PUBLISH;
-import org.fusesource.mqtt.codec.PUBREC;
-import org.fusesource.mqtt.codec.PUBREL;
-import org.fusesource.mqtt.codec.SUBACK;
-import org.fusesource.mqtt.codec.SUBSCRIBE;
-import org.fusesource.mqtt.codec.UNSUBACK;
-import org.fusesource.mqtt.codec.UNSUBSCRIBE;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.nio.charset.Charset;
+import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.zip.DataFormatException;
+import java.util.zip.Inflater;
 
 public class MQTTProtocolConverter {
 
@@ -124,6 +90,25 @@ public class MQTTProtocolConverter {
     private int activeMQSubscriptionPrefetch = -1;
     private final MQTTPacketIdGenerator packetIdGenerator;
     private boolean publishDollarTopics;
+
+    private final static long MESSAGE_TIME_LIMIT;
+
+    static {
+        long timeLimit;
+        try {
+            String activemqConfPath = System.getProperty("activemq.conf");
+            Properties properties = new Properties();
+            properties.load(new FileInputStream(new File(activemqConfPath, "activemq.properties")));
+            String limit = properties.getProperty("activemq.message.time.limit", "86400");
+            timeLimit = Long.parseLong(limit) * 1000;
+        } catch (Throwable e) {
+            LOG.error("please check ${activemq.conf}/activemq.conf file.");
+            timeLimit = 24 * 60 * 60 * 1000;
+        }
+        MESSAGE_TIME_LIMIT = timeLimit;
+        LOG.info("activemq.message.time.limit=" + MESSAGE_TIME_LIMIT);
+    }
+
 
     public int version;
 
@@ -461,8 +446,10 @@ public class MQTTProtocolConverter {
                     }
                 }
                 LOG.trace("MQTT Snd PUBLISH message:{} client:{} connection:{}",
-                          publish.messageId(), clientId, connectionInfo.getConnectionId());
-                getMQTTTransport().sendToMQTT(publish.encode());
+                        publish.messageId(), clientId, connectionInfo.getConnectionId());
+                if (!isMessageTimelimit(md.getMessage())) {
+                    getMQTTTransport().sendToMQTT(publish.encode());
+                }
                 if (ack != null && !sub.expectAck(publish)) {
                     getMQTTTransport().sendToActiveMQ(ack);
                 }
@@ -477,6 +464,37 @@ public class MQTTProtocolConverter {
             LOG.debug("Do not know how to process ActiveMQ Command {}", command);
         }
     }
+
+    /**
+     * 判断时限
+     * @param message
+     * @return
+     */
+    private synchronized boolean isMessageTimelimit(org.apache.activemq.command.Message message) {
+        try {
+            String physicalName = message.getDestination().getPhysicalName();
+            if (physicalName.toUpperCase().indexOf("IMGROUP") != -1) {
+                ByteSequence byteSequence = message.getContent();
+                if (byteSequence != null && byteSequence.length != 0) {
+                    byte[] dataArray = new byte[byteSequence.length];
+                    System.arraycopy(byteSequence.data, 0, dataArray, 0, byteSequence.length);
+                    String body = new String(dataArray, Charset.forName("utf-8"));
+                    Pattern p = Pattern.compile("sendTimestamp='([0-9]+)'");
+                    Matcher m = p.matcher(body);
+                    if (m.find()) {
+                        long sendStamp = Long.valueOf(m.group(1));
+                        long currentTimeMillis = System.currentTimeMillis() - MESSAGE_TIME_LIMIT;
+                        return (sendStamp < currentTimeMillis);
+                    }
+                }
+            }
+            return false;
+        } catch (Exception e) {
+            LOG.error("isMessageTimelimit", e);
+            return false;
+        }
+    }
+
 
     void onMQTTPublish(PUBLISH command) throws IOException, JMSException {
         checkConnected();
